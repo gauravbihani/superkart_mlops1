@@ -1,0 +1,106 @@
+name: SuperKart MLOps Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "model/**"
+      - "experiments/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # lets the train job commit the model back to main
+
+jobs:
+  register-data:
+    name: 1. Register and validate data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python src/register_data.py
+
+  data-prep:
+    name: 2. Clean data and split train/test
+    needs: register-data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python src/data_prep.py
+      - name: Share train/test splits with the next job
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+
+  train-model:
+    name: 3. Tune, evaluate and save model
+    needs: data-prep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Download train/test splits
+        uses: actions/download-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+      - run: python src/train.py
+      - name: Keep the experiment log with the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiment-logs
+          path: experiments/
+      - name: Commit model and logs to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add model/ experiments/tuning_trials.csv experiments/run_summary.json
+          if git diff --cached --quiet; then
+            echo "No model changes to commit"
+          else
+            git commit -m "chore: update trained model [skip ci]"
+            git push origin HEAD:main
+          fi
+
+  # Streamlit Community Cloud redeploys automatically when main changes,
+  # so the committed model reaches the live app without a separate deploy step.
+  app-smoke-test:
+    name: 4. Check the app can load the committed model
+    needs: train-model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Load model and predict on a sample row
+        run: |
+          python - <<'EOF'
+          import joblib, pandas as pd
+          m = joblib.load("model/best_model.joblib")
+          row = pd.DataFrame([{
+              "Product_Weight": 12.5, "Product_Sugar_Content": "Low Sugar",
+              "Product_Allocated_Area": 0.06, "Product_Type": "Dairy",
+              "Product_MRP": 147.0, "Store_Establishment_Year": 2009,
+              "Store_Size": "Medium", "Store_Location_City_Type": "Tier 2",
+              "Store_Type": "Supermarket Type2", "Product_Family": "FD"}])
+          print("Sample prediction:", float(m.predict(row)[0]))
+          EOF
